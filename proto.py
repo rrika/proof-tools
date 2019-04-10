@@ -127,11 +127,11 @@ def cases_res(steps, c_res):
 
 def cases_drat(steps, c_add, c_rup, c_rat, c_delete):
 	for i, step in enumerate(steps):
-		print(step)
+		#print(i, step)
 		if step[0] == "add":
 			if not c_add(i, step[1]):
 				return False
-		if step[0] == "rup":
+		elif step[0] == "rup":
 			if not c_rup(i, step[1]):
 				return False
 		elif step[0] == "rat" and c_rat:
@@ -357,8 +357,10 @@ def unit_propagate(formula, initial_assignment):
 	def unit_under_assignment(clause):
 		a = 0
 		for lit in clause:
-			v = abs(lit)
-			t = assignment.get(v, 0) * v
+			if lit > 0:
+				t = assignment.get(lit, 0)
+			else:
+				t = -assignment.get(-lit, 0)
 			if t == 1:
 				return 0
 			if t == 0:
@@ -398,31 +400,40 @@ def check_drat(formula, proof_drat):
 
 	def on_rup(i, clause):
 		assignment_falsifying_clause = [-a for a in clause]
-		if unit_propagate(formula, assignment_falsifying_clause):
+		if unit_propagate(formula, assignment_falsifying_clause) is not None:
 			#print("rup addition of", clause, "failed")
 			return False
 		formula.append(frozenset(clause))
 		return True
 
 	def on_rat(i, clause, literal):
+		#print([list(c) for c in formula], clause, literal)
 		for r in resolvents(formula, clause, literal):
 			assignment_falsifying_resolvent = [-a for a in r]
-			if unit_propagate(formula, assignment_falsifying_resolvent):
+			if unit_propagate(formula, assignment_falsifying_resolvent) is not None:
 				#print("rat addition of", clause, "failed because of resolvent", r)
 				return False
+		#print("rat addition of", clause, "succeeded")
 		formula.append(frozenset(clause))
 		return True
 
 	def on_delete(i, clause):
 		nonlocal formula
-		clause = frozenset(clause)
-		formula = [c for c in formula if c != clause]
+		n = len(formula)
+		zclause = frozenset(clause)
+		formula = [c for c in formula if c != zclause]
 		return True
 
 	if cases_drat(proof_drat, on_add, on_rup, on_rat, on_delete):
-		if unit_propagate(formula, units_of_formula(formula)):
-			return False
-		return True
+		#print("final formula=", [list(c) for c in formula])
+
+		if frozenset() in formula:
+			#print("empty clause derived")
+			return True
+		if unit_propagate(formula, units_of_formula(formula)) is None:
+			#print("conflict in unit propagation")
+			return True
+		return False
 	else:
 		return False
 
@@ -440,7 +451,7 @@ def convert_pr_to_drat(formula, proof_pr):
 	def on_add(i, clause, witness):
 		clause = tuple(clause)
 		c = set(clause)
-		w = set(witness)
+		w = witness and set(witness)
 
 		if not witness:
 			proof_drat.append(("rup", clause))
@@ -471,10 +482,10 @@ def convert_pr_to_drat(formula, proof_pr):
 
 			for fclause in sat_by_witness:
 				proof_drat.append(("add", (x,) + fclause))
-				proof_drat.append(("remove", fclause))
+				proof_drat.append(("delete", fclause))
 
 			for lit in witness:
-				proof_drat.append(("remove", (lit, -x)))
+				proof_drat.append(("delete", (lit, -x)))
 
 			# 3
 			proof_drat.append(("add", (x,) + clause))
@@ -485,21 +496,21 @@ def convert_pr_to_drat(formula, proof_pr):
 
 			for fclause in sat_by_witness + [clause]:
 				proof_drat.append(("add", fclause))
-				proof_drat.append(("remove", (x,) + fclause))
+				proof_drat.append(("delete", (x,) + fclause))
 
 			for lit in witness:
-				proof_drat.append(("remove", (-x, lit)))
+				proof_drat.append(("delete", (-x, lit)))
 
 			# 5
 			for fclause in red_by_witness:
-				proof_drat.append(("remove", (-x,) + tuple(fclause)))
+				proof_drat.append(("delete", (-x,) + tuple(fclause)))
 
 		formula.append(clause)
 		return True
 
 	def on_delete(i, clause):
 		nonlocal formula
-		proof_drat.append(("remove", clause))
+		proof_drat.append(("delete", clause))
 		formula = [fclause for fclause in formula if set(clause) != set(fclause)]
 		return True
 
@@ -756,8 +767,8 @@ def test():
 		[-4, -5], [-4, -6], [-5, -6]
 	]
 	php2_pr = [
-		["add", [-1, -5], [1, 5, -2, -4]],
-		["add", [-2, -4], [2, 4, -1, -5]]
+		["add", [-2, -4], [2, 4, -1, -5]],
+		["add", [-4], None]
 	]
 
 	def damage_qres(f, qres):
@@ -776,6 +787,10 @@ def test():
 				return False
 		return True
 
+	assert not check_res(f0, [])
+	assert not check_qres(f1, [])
+	assert not check_drat(f4, [])
+	assert not check_drat(php2, [])
 
 	assert check_res(f0, f0_res)
 	assert check_res(f0, trim_res(f0, f0_res))
@@ -807,6 +822,7 @@ def test():
 
 	php2_drat = convert_pr_to_drat(php2, php2_pr)
 	pprint(php2_drat)
+	assert check_drat(php2, php2_drat)
 
 if __name__ == '__main__':
 	test()
