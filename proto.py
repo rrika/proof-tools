@@ -77,8 +77,7 @@
 #   check_lrat
 
 #   convert_res_to_drat     OK
-#   convert_drat_to_lrat
-#   convert_lrat_to_drat
+#   convert_drat_to_lrat    OK
 #   convert_pr_to_drat      OK
 
 #   trim_res                OK
@@ -89,7 +88,7 @@
 
 #   check_qres              OK
 #   check_ldqres
-#   check_aexpres
+#   check_aexpres           OK
 #   check_ir                OK
 #   check_irm
 #   check_qrat
@@ -255,7 +254,7 @@ def _res_to_clausal_proof(formula, proof_res):
 	def on_res(i, a, b):
 		pa, pb, r = resolve(res_clauses[a], res_clauses[b], lambda l: l)
 		if pa is None:
-			#print("step {}, resolution of {} and {} failed".format(i, ca, cb))
+			#print("step {}, resolution of {} and {} failed".format(i, a, b))
 			return False
 		res_clauses.append(r)
 		#print("res {} x {} → {}".format(res_clauses[a], res_clauses[b], r))
@@ -352,7 +351,16 @@ def resolvents(formula, clause, literal):
 			if r == False: assert False
 			yield r
 
-def unit_propagate(formula, initial_assignment):
+def enum_resolvents(formula, clause, literal):
+	assert literal in clause
+	for i, d in enumerate(formula):
+		if -literal in d:
+			pa, pb, r = resolve(clause, d, lambda l: l)
+			if r == True: continue # tautology
+			if r == False: assert False
+			yield i, r
+
+def unit_propagate_(formula, initial_assignment):
 	assignment = {}
 	def unit_under_assignment(clause):
 		a = 0
@@ -369,18 +377,51 @@ def unit_propagate(formula, initial_assignment):
 				a = lit
 		return a
 
+	initial_assignment = tuple(initial_assignment)
+
+	reason = {l: -1 for l in initial_assignment}
+	seen = {-1}
+	hints = []
+	def reason_dfs(ci, x):
+		if ci in seen:
+			return
+		seen.add(ci)
+		c = tuple(formula[ci])
+		#print(ci, c, [reason.get(-lit, None) for lit in c], "excused=", x)
+		for lit in c:
+			if lit != x:
+				reason_dfs(reason[-lit], -lit)
+		hints.append(ci)
+
 	queue = set(initial_assignment)
+	#print(queue)
 	while queue:
 		a = queue.pop()
+		#print(" unit prop", a)
 		k = 1 if a > 0 else -1
-		if assignment.get(abs(a), 0) == -k:
-			return
 		assignment[abs(a)] = k
-		for clause in formula: # terrible performance
+		for i, clause in enumerate(formula): # terrible performance
 			a2 = unit_under_assignment(clause)
 			if a2:
+				if a2 not in reason:
+					#print(" reason[{}] = {} {}".format(a2, i, tuple(clause)))
+					reason[a2] = i
+				if -a2 in reason:
+					#print("reason =", reason)
+					reason_dfs(reason[a2], a2)
+					reason_dfs(reason[-a2], -a2)
+					#print("unsat", hints)
+					return False, hints
+
 				queue.add(a2)
-	return [k*v for k, v in assignment.items()]
+
+	#print("sat")
+	return True, [k*v for k, v in assignment.items()]
+
+def unit_propagate(formula, initial_assignment):
+	sat, assignment_or_hints = unit_propagate_(formula, initial_assignment)
+	if sat:
+		return assignment_or_hints
 
 def units_of_formula(formula):
 	for clause in formula:
@@ -389,8 +430,16 @@ def units_of_formula(formula):
 			yield unit
 
 def check_drat(formula, proof_drat):
+	proof = check_drat_2(formula, proof_drat, generate_lrat=False)
+	return proof is not None
+
+def convert_drat_to_lrat(formula, proof_drat):
+	return check_drat_2(formula, proof_drat, generate_lrat=True)
+
+def check_drat_2(formula, proof_drat, generate_lrat):
 
 	formula = [frozenset(clause) for clause in formula.clauses[:]]
+	lrat = []
 
 	def on_add(i, clause):
 		if on_rup(i, clause): return True
@@ -400,24 +449,32 @@ def check_drat(formula, proof_drat):
 
 	def on_rup(i, clause):
 		assignment_falsifying_clause = [-a for a in clause]
-		if unit_propagate(formula, assignment_falsifying_clause) is not None:
+		sat, hints = unit_propagate_(formula, assignment_falsifying_clause)
+		if sat:
 			#print("rup addition of", clause, "failed")
 			return False
 		formula.append(frozenset(clause))
+		lrat.append(["rup", clause, hints])
 		return True
 
 	def on_rat(i, clause, literal):
 		#print([list(c) for c in formula], clause, literal)
-		for r in resolvents(formula, clause, literal):
+		rhints = []
+		for ci, r in enum_resolvents(formula, clause, literal):
 			assignment_falsifying_resolvent = [-a for a in r]
-			if unit_propagate(formula, assignment_falsifying_resolvent) is not None:
+			sat, hints = unit_propagate_(formula, assignment_falsifying_resolvent)
+			if sat:
 				#print("rat addition of", clause, "failed because of resolvent", r)
 				return False
+			rhints.append([ci, hints])
 		#print("rat addition of", clause, "succeeded")
 		formula.append(frozenset(clause))
+		lrat.append(["rat", clause, literal, rhints])
 		return True
 
 	def on_delete(i, clause):
+		if generate_lrat:
+			return True
 		nonlocal formula
 		n = len(formula)
 		zclause = frozenset(clause)
@@ -428,14 +485,14 @@ def check_drat(formula, proof_drat):
 		#print("final formula=", [list(c) for c in formula])
 
 		if frozenset() in formula:
-			#print("empty clause derived")
-			return True
-		if unit_propagate(formula, units_of_formula(formula)) is None:
-			#print("conflict in unit propagation")
-			return True
-		return False
+			return lrat
+		sat, hints = unit_propagate_(formula, units_of_formula(formula))
+		if not sat:
+			lrat.append(["rup", [], hints])
+			return lrat
+		return None
 	else:
-		return False
+		return None
 
 def convert_res_to_drat(formula, proof_res):
 	res_clauses = _res_to_clausal_proof(formula, proof_res)
@@ -570,6 +627,47 @@ def check_qres(formula, proof_qres):
 		return len(qres_clauses[-1]) == 0
 	else:
 		return False
+
+def check_aexpres(formula, proof_aexpres):
+	nf = []
+	np = []
+	nv = {}
+
+	def on_axiom(i, index, assignment):
+		c = formula.clauses[index]
+		nc = []
+		for lit in c:
+			v = abs(lit)
+			q = formula.quant[v]
+			if q == "E":
+				tnlit = (v,) + tuple(assignment[dep] for dep in formula.quantdep[v])
+				nva = nv.setdefault(tnlit, len(nv))
+				nlit = nva if lit > 0 else -nva
+				nc.append(nlit)
+			elif q == "A":
+				if lit > 0 and assignment[v]:
+					# tautology
+					nc = None
+					break
+		nf.append(nc)
+		return True
+
+	def on_res(i, a, b):
+		np.append(["res", a, b])
+		return True
+
+	if cases_aexpres(proof_aexpres, on_axiom, on_res):
+		nfo = Formula()
+		nfo.clauses = nf
+		#print("converted aexpres proof to res proof")
+		#from pprint import pprint
+		#pprint(nv)
+		#pprint(nf)
+		#pprint(np)
+		return check_res(nfo, np)
+	else:
+		return False
+
 
 def _repr_ir(c):
 	return "("+(" ".join("{}={}".format(lit, list(lassign)) for lit, lassign in c))+")"
@@ -726,6 +824,20 @@ def test():
 		["res", 9, 10] # 11: []
 	]
 
+	f2_aexpres = [
+		["axiom", 4, {2: False, 5: False}], # 0: [-3f, -4f]
+		["axiom", 0, {2: False, 5: True}],  # 1: [-1,  -7ft]
+		["axiom", 1, {2: False, 5: True}],  # 2: [ 6ft, 7ft]
+		["axiom", 2, {2: False, 5: True}],  # 3: [ 3f, -6ft]
+		["axiom", 3, {2: False, 5: True}],  # 4: [ 4f, -6ft]
+		["axiom", 5, {2: False, 5: True}],  # 5: [ 1,   6ft]
+		["res", 0, 3],
+		["res", 6, 4],
+		["res", 1, 2],
+		["res", 8, 5],
+		["res", 7, 9],
+	]
+
 	f3 = Formula()
 	f3.clauses = [[1], [-1, 2], [-2, 3], [-3]]
 	f3_res = [
@@ -812,6 +924,8 @@ def test():
 	assert check_ir(f2, f2_ir)
 	print()
 
+	assert check_aexpres(f2, f2_aexpres)
+
 	assert check_res(f3, f3_res)
 	assert check_res(f3, trim_res(f3, f3_res))
 	r = interpolant_res(f3, f3_res, [0, 0, 1, 1])
@@ -819,6 +933,9 @@ def test():
 	print()
 
 	assert check_drat(f4, f4_drat)
+	f4_lrat = convert_drat_to_lrat(f4, f4_drat)
+	pprint(f4.clauses)
+	pprint(f4_lrat)
 
 	php2_drat = convert_pr_to_drat(php2, php2_pr)
 	pprint(php2_drat)
