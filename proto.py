@@ -199,6 +199,7 @@ def cases_irm(steps, c_res, c_inst, c_merge):
 ########
 
 def resolve(ca, cb, onlylit):
+	# does clause resolution or cube consensus (aka. cube resolution)
 	#	assert isinstance(ca, frozenset), type(ca)
 	#	assert isinstance(cb, frozenset), type(cb)
 	la = {onlylit(litx) for litx in ca}
@@ -228,7 +229,28 @@ class Formula:
 	def __init__(self):
 		self.quant = []
 		self.quantdep = []
+		self.complement_quantdep = None
 		self.clauses = []
+
+	def calc_complement_quantdep(self):
+		self.complement_quantdep = [
+			[j for j, qd in enumerate(self.quantdep[i]) if i not in qd]
+			if q == "A" and i > 0 else None
+			for i, q in enumerate(self.quant)
+		]
+
+	def has_dependency_cycle_with_complement(self):
+		if self.complement_quantdep is None:
+			self.calc_complement_quantdep()
+
+		alldeps = [qd or cqd for qd, cqd in zip(self.quantdep, self.complement_quantdep)]
+		import networkx as nx # TODO: make our own dfs based cycle check
+		g = nx.DiGraph((i, j) for i, dep in enumerate(alldeps) if i > 0 for j in dep)
+		try:
+			nx.algorithms.cycles.find_cycle(g, source=None, direction="original")
+		except:
+			return False
+		return True
 
 	def qsplit(self, clause):
 		forall = [lit for lit in clause if self.quant[abs(lit)] == "A"]
@@ -241,6 +263,17 @@ class Formula:
 			union.update(self.quantdep[abs(lit)])
 		return frozenset(union)
 
+	def complement_depunion(self, lits):
+		union = set()
+		for lit in lits:
+			union.update(self.complement_quantdep[abs(lit)])
+		return frozenset(union)
+
+	def check_solution(self, assignment):
+		for clause in self.clauses:
+			if not any(lit in assignment for lit in clause):
+				return False
+		return True
 
 def check_res(formula, proof_res):
 	res_clauses = _res_to_clausal_proof(formula, proof_res)
@@ -587,8 +620,8 @@ def a_reduction(formula, clause):
 	# that no exists quantified literals depend on
 
 	# example:
-	# formula.quant    = ["A",  "E", "A" ]
-	# formula.quantdep = [None, [0], None]
+	# formula.quant    = ["X",  "A",  "E", "A" ]
+	# formula.quantdep = [None, None, [1], None]
 	# clause           = [1, 2, 3]
 	# returns          = [1, 2], [3]
 
@@ -602,21 +635,78 @@ def a_reduction(formula, clause):
 
 	return (exists + forall_d)
 
+def e_reduction(formula, cube):
+	# from a cube remove all exists quantified literals
+	# that no forall quantified literals depend on
+	forall, exists     = formula.qsplit(cube)
+	fadeps             = formula.complement_depunion(forall)
+	exists_d, exists_u = vsplit(exists, fadeps)
+	return (forall + exists_d)
+
+
 def negmap(clause):
 	assignment = frozenset(-lit for lit in clause)
 	return assignment
 
-def check_qres(formula, proof_qres):
+def check_qres(formula, proof_qres, original_formula=None):
+	# For UNSAT proofs (original_formula is None)
+	#  0: clause from formula
+	#  1: clause from formula
+	#  ...
+	#  8: clause q-resolution (applies a-reduction)
+	#  9: clause q-resolution (applies a-reduction)
+
+	# For SAT proofs (original_formula is not None)
+	#  0: cube that is solution to formula
+	#  1: cube that is solution to formula
+	#  ...
+	#  8: cube q-consensus (applies e-reduction)
+	#  9: cube q-consensus (applies e-reduction)
+
+	# For SAT proofs the following extra checks are necessary
+	# for each leaf (which is a cube/assignment)
+	#    evaluate original formula under the assignment
+	#      simplifies to true -> good, continue
+	#      else -> remove all forall quantified literals, SAT solve it
+	#        SAT -> good, continue
+	#        UNSAT -> error
+
+	if original_formula:
+		# we start with cubes that are solutions of the original formula
+
+		cubes = formula.clauses # lol
+		of = Formula()
+		of.clauses = original_formula
+		for cube in cubes:
+			if not of.check_solution(cube):
+				# print("initial cube not a solution", cube)
+				# TODO
+				return False
+
+		if formula.has_dependency_cycle_with_complement():
+			# print("in certain DQBF skolem functions cannot be derived from the proof of the complement")
+			# TODO
+			return False
+		reduction = e_reduction
+		resolve_on = "A"
+	else:
+		# we start with clauses of the original formula
+		reduction = a_reduction
+		resolve_on = "E"
+
 	qres_clauses = formula.clauses[:]
 
 	def on_qres(i, a, b):
-		ca = a_reduction(formula, qres_clauses[a])
-		cb = a_reduction(formula, qres_clauses[b])
+		ca = reduction(formula, qres_clauses[a])
+		cb = reduction(formula, qres_clauses[b])
 		pa, pb, r = resolve(ca, cb, lambda l: l)
 		if pa is None:
 			#print("step {}, resolution of {} and {} failed".format(i, ca, cb))
 			return False
-		rr = a_reduction(formula, r)
+		if formula.quant[abs(pa)] != resolve_on:
+			#print("step {}, pivot {} not on {}-quantified variable".format(i, abs(pa), resolve_on))
+			return False
+		rr = reduction(formula, r)
 		qres_clauses.append(rr)
 		#print("qres {} x {} → {}".format(qres_clauses[a], qres_clauses[b], rr))
 		#print(" after forall reduction {} x {}".format(ca, cb))
@@ -770,6 +860,67 @@ def convert_qres_to_ir(formula, proof_qres):
 	if cases_qres(proof_qres, on_qres):
 		return proof_ir
 
+def skolem_qres(formula, proof_qres, sat):
+	qres_clauses = formula.clauses[:]
+
+	if sat:
+		reduction = e_reduction
+	else:
+		reduction = a_reduction
+
+	reduced_at_node = {}
+	pivot_at_node = {}
+	antecedents = {}
+
+	for i, cc in enumerate(qres_clauses):
+		rcc = reduction(formula, cc)
+		qres_clauses[i] = rcc
+		reduced_at_node[i] = set(cc)-set(rcc)
+
+	def on_qres(i, a, b):
+		# everything reduced up-front
+		# ca = a_reduction(formula, qres_clauses[a])
+		# cb = a_reduction(formula, qres_clauses[b])
+		ca = qres_clauses[a]
+		cb = qres_clauses[b]
+		pa, pb, r = resolve(ca, cb, lambda l: l)
+		if pa is None:
+			return False
+		rr = reduction(formula, r)
+		reduced_at_node[len(qres_clauses)] = set(r)-set(rr)
+		pivot_at_node[len(qres_clauses)] = pa
+		antecedents[len(qres_clauses)] = (a, b)
+		qres_clauses.append(rr)
+		return True
+
+	if not cases_qres(proof_qres, on_qres):
+		return
+
+	seen = set()
+	topo = []
+	def visit(n):
+		if n in seen: return
+		for a in antecedents.get(n, []):
+			visit(a)
+		topo.append(n)
+	visit(len(qres_clauses)-1)
+
+	expr = {}
+
+	for n in reversed(topo):
+		for l in reduced_at_node.get(n, []):
+			v = abs(l)
+			if v not in expr:
+				expr[v] = True if l > 0 else False
+			elif l > 0:
+				q = ("and",) + tuple(-l for l in qres_clauses[n])
+				expr[v] = ("or", expr[v], q)
+			else:
+				q = ("or",) + tuple(qres_clauses[n])
+				expr[v] = ("and", expr[v], q)
+
+	return expr
+
 def test():
 	from pprint import pprint
 
@@ -788,7 +939,7 @@ def test():
 
 	f1 = Formula()
 	f1.quant = "XEA"
-	f1.quantdep = [None, [], []]
+	f1.quantdep = [None, [], None]
 	f1.clauses = [[1, 2], [-1, -2]]
 
 	f1_qres = [
@@ -883,6 +1034,18 @@ def test():
 		["add", [-4], None]
 	]
 
+	f5 = Formula()
+	f5.quant = "XAE"
+	f5.quantdep = [None, [], [1]]
+	f5.clauses = [[1, 2], [-1, -2]]
+	f5_original_clauses = [[1, -2], [-1, 2]]
+
+	f5_qres = [
+		# 0: initial [1, 2],
+		# 1: initial [-1, -2],
+		["res", 0, 1] # 2
+	]
+
 	def damage_qres(f, qres):
 		for i in range(len(qres)):
 			qres_broken = qres[:]
@@ -940,6 +1103,11 @@ def test():
 	php2_drat = convert_pr_to_drat(php2, php2_pr)
 	pprint(php2_drat)
 	assert check_drat(php2, php2_drat)
+
+	assert check_qres(f5, f5_qres, f5_original_clauses)
+	skolems = skolem_qres(f5, f5_qres, True)
+	for (n, sk) in skolems.items():
+		print(" e{} = {}".format(n, sk))
 
 if __name__ == '__main__':
 	test()
