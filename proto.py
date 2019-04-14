@@ -16,6 +16,7 @@
 #   step = ["rat", clause, literal,
 #           [[resolve_index, propagation_indices],
 #            [resolve_index, propagation_indices]]]
+#   step = ["delete"]
 #   clause = [lit, lit, ...]
 
 #   PR
@@ -104,7 +105,9 @@
 #   convert_qres_to_qrat
 #   convert_ldqres_to_qrat
 
-#   skolem_qres
+#   trim_qrat
+
+#   skolem_qres             OK
 #   skolem_irm
 #   skolem_qrat
 
@@ -143,13 +146,16 @@ def cases_drat(steps, c_add, c_rup, c_rat, c_delete):
 			return False
 	return True
 
-def cases_lrat(steps, c_rup, c_rat):
+def cases_lrat(steps, c_rup, c_rat, c_delete):
 	for i, step in enumerate(steps):
 		if step[0] == "rup":
 			if not c_rup(i, step[1], step[2]):
 				return False
 		elif step[0] == "rat":
 			if not c_rat(i, step[1], step[2], step[3]):
+				return False
+		elif step[0] == "delete":
+			if not c_delete(i, step[1]):
 				return False
 		else:
 			return False
@@ -393,6 +399,42 @@ def enum_resolvents(formula, clause, literal):
 			if r == False: assert False
 			yield i, r
 
+def unit_propagate_with_hints(formula, initial_assignment, hints):
+	assignment = {abs(l): -1 if l<0 else 1 for l in initial_assignment}
+
+	def unit_under_assignment(clause):
+		a = None
+		for lit in clause:
+			if lit > 0:
+				t = assignment.get(lit, 0)
+			else:
+				t = -assignment.get(-lit, 0)
+			if t == 1:
+				return 0
+			if t == 0:
+				if a is not None:
+					return 0
+				a = lit
+		return a
+
+	for hint in hints:
+		#print(assignment)
+		a = unit_under_assignment(formula[hint])
+		if a is None:
+			#print(" hint", hint, list(formula[hint]), "gives contradiction")
+			return False
+		if a == 0:
+			#print(" hint", hint, list(formula[hint]), "gives no information")
+			return True
+		#print(" hint", hint, list(formula[hint]), "gives unit", a)
+		i = 0
+		k = 1 if a > 0 else -1
+		if assignment.get(abs(a), 0) == -k:
+			return False
+		assignment[abs(a)] = k
+
+	return True
+
 def unit_propagate_(formula, initial_assignment):
 	assignment = {}
 	def unit_under_assignment(clause):
@@ -410,7 +452,7 @@ def unit_propagate_(formula, initial_assignment):
 				a = lit
 		return a
 
-	initial_assignment = tuple(initial_assignment)
+	initial_assignment = list(initial_assignment)
 
 	reason = {l: -1 for l in initial_assignment}
 	seen = {-1}
@@ -427,6 +469,15 @@ def unit_propagate_(formula, initial_assignment):
 		hints.append(ci)
 
 	queue = set(initial_assignment)
+	for ci, clause in enumerate(formula):
+		if clause != [None]:
+			a = unit_under_assignment(clause)
+			if a != 0:
+				queue.add(a)
+				if -a in reason: return [ci]
+				if a in reason: continue
+				reason[a] = ci
+
 	#print(queue)
 	while queue:
 		a = queue.pop()
@@ -434,6 +485,8 @@ def unit_propagate_(formula, initial_assignment):
 		k = 1 if a > 0 else -1
 		assignment[abs(a)] = k
 		for i, clause in enumerate(formula): # terrible performance
+			if clause == [None]: # deleted clause
+				continue
 			a2 = unit_under_assignment(clause)
 			if a2:
 				if a2 not in reason:
@@ -458,6 +511,8 @@ def unit_propagate(formula, initial_assignment):
 
 def units_of_formula(formula):
 	for clause in formula:
+		if clause == [None]:
+			continue
 		if len(clause) == 1:
 			unit, = clause
 			yield unit
@@ -497,35 +552,93 @@ def check_drat_2(formula, proof_drat, generate_lrat):
 			assignment_falsifying_resolvent = [-a for a in r]
 			sat, hints = unit_propagate_(formula, assignment_falsifying_resolvent)
 			if sat:
-				#print("rat addition of", clause, "failed because of resolvent", r)
+				#print("rat addition of", clause, "failed because of resolvent", r, "of clause")
 				return False
-			rhints.append([ci, hints])
+			rhints.append([ci, hints[1:]])
 		#print("rat addition of", clause, "succeeded")
 		formula.append(frozenset(clause))
 		lrat.append(["rat", clause, literal, rhints])
 		return True
 
 	def on_delete(i, clause):
-		if generate_lrat:
-			return True
 		nonlocal formula
-		n = len(formula)
 		zclause = frozenset(clause)
-		formula = [c for c in formula if c != zclause]
-		return True
+		for ci, c in enumerate(formula):
+			if c == zclause:
+				formula[ci] = [None]
+				if lrat and lrat[-1][0] == "delete":
+					# merge with prior delete
+					lrat[-1][1].append(ci)
+				else:
+					# new delete
+					lrat.append(["delete", [ci]])
+				return True
+		return False
 
 	if cases_drat(proof_drat, on_add, on_rup, on_rat, on_delete):
 		#print("final formula=", [list(c) for c in formula])
 
 		if frozenset() in formula:
 			return lrat
-		sat, hints = unit_propagate_(formula, units_of_formula(formula))
+		sat, hints = unit_propagate_(formula, [])
 		if not sat:
 			lrat.append(["rup", [], hints])
 			return lrat
 		return None
 	else:
 		return None
+
+def check_lrat(formula, proof_lrat):
+	# TODO: change python representation of lrat proof to have the
+	# per-step clause numbers as lrat files can gave gaps in the numbering
+	# while the formula.append approach assumes consequtive numbers
+
+	formula = [frozenset(clause) for clause in formula.clauses[:]]
+
+	def on_rup(i, clause, hints):
+		#print([list(c) for c in formula], clause, hints)
+		assignment_falsifying_clause = [-a for a in clause]
+		sat = unit_propagate_with_hints(formula, assignment_falsifying_clause, hints)
+		if sat:
+			#print("rup addition of", clause, "failed")
+			return False
+		formula.append(frozenset(clause))
+		return True
+
+	def on_rat(i, clause, literal, rhints):
+		#print([list(c) for c in formula], clause, literal)
+		rci = set()
+		rhints = dict(rhints)
+		for ci, r in enum_resolvents(formula, clause, literal):
+			if ci not in rhints:
+				#print("resolvent", r, "was ignored by lrat proof")
+				return False
+
+			assignment_falsifying_resolvent = [-a for a in r]
+			sat = unit_propagate_with_hints(formula, assignment_falsifying_resolvent, [ci]+rhints.pop(ci))
+			if sat:
+				#print("rat addition of", clause, "failed because of resolvent", r, "of clause", ci)
+				return False
+		if rhints:
+			#print("unused hints in lrat", rhints)
+			return False
+		#print("rat addition of", clause, "succeeded")
+		formula.append(frozenset(clause))
+		return True
+
+	def on_delete(i, indices):
+		for ci in indices:
+			formula[ci] = [None]
+		return True
+
+	if cases_lrat(proof_lrat, on_rup, on_rat, on_delete):
+		#print("final formula=", [list(c) for c in formula])
+
+		if frozenset() in formula:
+			return True
+		return False
+	else:
+		return False
 
 def convert_res_to_drat(formula, proof_res):
 	res_clauses = _res_to_clausal_proof(formula, proof_res)
@@ -1022,6 +1135,22 @@ def test():
 		# units -1 and 2 in the formula leads
 		# to a conflict
 	]
+	f4_lrat = [
+		# 8 d 0
+		# 9 -1 0 -1 5 7 -6 2 7 -8 5 2 0
+		# 9 d 7 5 2 0
+		# 10 2 0 9 1 6 3 0
+		# 10 d 1 3 0
+		# 12 0 9 10 8 4 6 0
+		["rat", [-1], -1, [ # 8
+			[1-1, [5-1, 7-1]],
+			[6-1, [2-1, 7-1]],
+			[8-1, [5-1, 2-1]]]],
+		["delete", [7-1, 5-1, 2-1]],
+		["rup", [2], [9-1, 1-1, 6-1, 3-1]],
+		["delete", [1-1, 3-1]],
+		["rup", [], [9-1, 10-1, 8-1, 4-1, 6-1]]
+	]
 
 	php2 = Formula()
 	php2.clauses = [
@@ -1096,9 +1225,12 @@ def test():
 	print()
 
 	assert check_drat(f4, f4_drat)
-	f4_lrat = convert_drat_to_lrat(f4, f4_drat)
+	assert check_lrat(f4, f4_lrat)
+	f4_lrat_2 = convert_drat_to_lrat(f4, f4_drat)
 	pprint(f4.clauses)
 	pprint(f4_lrat)
+	pprint(f4_lrat_2)
+	assert check_lrat(f4, f4_lrat_2)
 
 	php2_drat = convert_pr_to_drat(php2, php2_pr)
 	pprint(php2_drat)
