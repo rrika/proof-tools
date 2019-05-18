@@ -32,14 +32,24 @@
 #   See "On Unification of QBF Resolution-Based Calculi" by Olaf Beyersdorff, Leroy Chew, and Mikoláš Janota
 #   See "Efficient Extraction of Skolem Functions from QRAT Proofs" by Marijn J.H. Heule
 #   See "QRAT+: Generalizing QRAT by a More Powerful QBF Redundancy Property" by Florian Lonsing and Uwe Egly
+#   See "Q-Resolution with Generalized Axioms" by Florian Lonsing, Uwe Egly, and Martina Seidl
 
 #   Q-Resolution
+#   step = ["cu-init", cube]
+#   step = ["cl-init", clause]
 #   step = ["res", index, index]
 #   clause = [lit, lit, ...]
 
 #   Long distance Q-Resolution
+#   step = ["cu-init", cube]
+#   step = ["cl-init", clause]
 #   step = ["res", index, index]
 #   clause = [(lit, has_star), (lit, has_star), ...]
+
+#   + Generalized Axioms
+#   step = ["gen-cu-init", cube]
+#   step = ["gen-cl-init", clause]
+#   step = ["abs-cl-init", clause]
 
 #   ∀Exp+Res
 #   step = ["axiom", index, assignment]
@@ -73,9 +83,19 @@
 
 # Operations
 
+#   parse_dimacs            OK
+#   parse_qdimacs           OK
+#   parse_drup              OK
+#   parse_drat              OK
+#   parse_lrat              OK
+#   parse_pr                OK
+#   parse_qrp               ..
+
+#   write_aig
+
 #   check_res               OK
 #   check_drat              OK
-#   check_lrat
+#   check_lrat              OK
 
 #   convert_res_to_drat     OK
 #   convert_drat_to_lrat    OK
@@ -116,7 +136,13 @@
 #   dep_rrs
 #     see "Soundness of Q-resolution with dependency schemes" by Friedrich Slivovsky and Stefan Szeider
 
-
+# Proof types and who outputs them
+#  qres
+#  qres + generalized axioms
+#  ldqres
+#   ?
+#  ir(m)
+#   ?
 
 def cases_res(steps, c_res):
 	for i, step in enumerate(steps):
@@ -204,6 +230,178 @@ def cases_irm(steps, c_res, c_inst, c_merge):
 
 ########
 
+import re
+num_re = re.compile(r"-?\d+")
+
+class Parser:
+	def __init__(self, lines):
+		self.lines = lines
+		self.eof = False
+		self.nextline()
+
+		self.seqs = []
+
+	def nextline(self):
+		try:
+			self.line = next(self.lines)
+		except StopIteration:
+			self.eof = True
+
+	def skipws(self):
+		if self.eof:
+			return False
+		self.line = self.line.lstrip()
+		try:
+			while not self.line:
+				self.line = next(self.lines)
+				self.line = self.line.lstrip()
+		except StopIteration:
+			self.eof = True
+		return not self.eof
+
+	def accept(self, t):
+		if self.line.startswith(t):
+			self.line = self.line[len(t):]
+			self.skipws()
+			return True
+
+	def num(self):
+		m = num_re.match(self.line)
+		assert m, "expected number: "+self.line
+		n = int(m.group(0))
+		self.line = self.line[m.end():]
+		self.skipws()
+		return n
+
+	def seq(self):
+		s = []
+		for n in iter(self.num, 0):
+			s.append(n)
+		return s
+
+def parse_preable(p, name):
+	while not p.eof:
+		if p.line[0] == "#":
+			p.skipline()
+
+		elif p.accept("p"):
+			p.skipws()
+			assert p.accept(name), "expected {}, got {}".format(name, p.line)
+			p.num1 = p.num()
+			p.num2 = p.num()
+			p.skipws()
+			return
+
+		else:
+			assert False, "unexpected line in preable: "+p.line
+
+	assert False, "early EOF"
+
+def parse_quantifiers(p):
+	p.prefix = prefix = []
+	while not p.eof:
+		if p.accept("a"):
+			prefix.append(("a", p.seq()))
+		elif p.accept("e"):
+			prefix.append(("e", p.seq()))
+		else:
+			return
+
+	assert False, "early EOF"
+
+def parse_seqs_clauses(p):
+	while not p.eof:
+		p.seqs.append(p.seq())
+
+def parse_seqs_double(p, f):
+	while not p.eof:
+		p.seqs.append(f(p.seq(), p.seq()))
+
+def parse_seqs_steps(p, add_name, del_name):
+	while not p.eof:
+		if p.accept("d"):
+			p.seqs.append((del_name, p.seq()))
+		else:
+			p.seqs.append((add_name, p.seq()))
+
+def parse_seqs_pr(p):
+	while not p.eof:
+		dflag = p.accept("d")
+		nums = p.seq()
+		if dflag:
+			p.seqs.append(["delete", nums])
+		elif nums[0] not in nums:
+			p.seqs.append(["add", nums, None])
+		else:
+			i = nums.index(nums[0], 1)
+			p.seqs.append(["add", nums[:i], nums[i:]])
+
+def parse_seqs_lrat(p):
+	while not p.eof:
+		n = p.num()
+		if p.accept("d"):
+			p.seqs.append(("delete", p.seq()))
+		else:
+			clause = p.seq()
+			hints = p.seq()
+			p.seqs.append(parse_step_lrat(clause, hints))
+
+
+def parse_step_lrat(clause, hints):
+	rup_prop = []
+	rat_prop = []
+	active = rup_prop
+	for h in hints:
+		if h > 0:
+			active.append(h-1)
+		else:
+			active = []
+			rat_prop.append((-h+1, active))
+	if rat_prop:
+		assert not rup_prop
+		return ["rat", clause, rat_prop]
+	else:
+		return ["rup", clause, rup_prop]
+
+
+def parse_dimacs(p):
+	parse_preable(p, "cnf")
+	parse_seqs_clauses(p)
+
+def parse_qdimacs(p):
+	parse_preable(p, "cnf")
+	parse_quantifiers(p)
+	parse_seqs_clauses(p)
+
+def parse_drup(p):
+	p.skipws()
+	parse_seqs_steps(p, "rup", "delete")
+
+def parse_drat(p):
+	p.skipws()
+	parse_seqs_steps(p, "add", "delete")
+
+def parse_lrat(p):
+	p.skipws()
+	parse_seqs_lrat(p)
+
+def parse_pr(p):
+	p.skipws() 
+	parse_seqs_steps(p, "add", "delete")
+
+def parse_qrp(p):
+	parse_preable(p, "qrp")
+	parse_quantifiers(p)
+	parse_seqs_double(p)
+
+def parse_qrat(p):
+	parse_seqs(p, "add", "delete")
+
+def write_aig(exprs):
+	pass
+
+########
+
 def resolve(ca, cb, onlylit):
 	# does clause resolution or cube consensus (aka. cube resolution)
 	#	assert isinstance(ca, frozenset), type(ca)
@@ -237,6 +435,13 @@ class Formula:
 		self.quantdep = []
 		self.complement_quantdep = None
 		self.clauses = []
+
+	@classmethod
+	def from_cnf(cls, nvar, clauses):
+		f = Formula()
+		f.quant = ["E"] * nvar
+		f.quantdep = [[] for i in range(nvar)]
+		f.clauses = clauses
 
 	def calc_complement_quantdep(self):
 		self.complement_quantdep = [
@@ -761,7 +966,7 @@ def negmap(clause):
 	assignment = frozenset(-lit for lit in clause)
 	return assignment
 
-def check_qres(formula, proof_qres, original_formula=None):
+def check_qres_auto_init(formula, proof_qres, original_formula=None):
 	# For UNSAT proofs (original_formula is None)
 	#  0: clause from formula
 	#  1: clause from formula
@@ -775,6 +980,10 @@ def check_qres(formula, proof_qres, original_formula=None):
 	#  ...
 	#  8: cube q-consensus (applies e-reduction)
 	#  9: cube q-consensus (applies e-reduction)
+	pass
+
+
+def check_qres(formula, proof_qres, generalized_axioms=False):
 
 	# For SAT proofs the following extra checks are necessary
 	# for each leaf (which is a cube/assignment)
@@ -1034,7 +1243,8 @@ def skolem_qres(formula, proof_qres, sat):
 
 	return expr
 
-def test():
+
+def test_check():
 	from pprint import pprint
 
 	f0 = Formula()
@@ -1242,4 +1452,5 @@ def test():
 		print(" e{} = {}".format(n, sk))
 
 if __name__ == '__main__':
-	test()
+	#test_parse()
+	test_check()
